@@ -1,0 +1,1 @@
+# okinawa-fudosan-scraper
