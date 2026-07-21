@@ -1,9 +1,9 @@
-name: 毎日スクレイピング
+name: Daily Scraping
 
 on:
   schedule:
-    - cron: "0 15 * * *"  # 毎日 00:00 JST（= 15:00 UTC）
-  workflow_dispatch:       # 手動実行も可能
+    - cron: '0 15 * * *'  # 毎日00:00 JST (= 15:00 UTC)
+  workflow_dispatch:        # 手動実行も可能
 
 jobs:
   scrape:
@@ -11,27 +11,75 @@ jobs:
     timeout-minutes: 360   # 最大6時間
 
     steps:
-      - name: リポジトリをチェックアウト
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Python をセットアップ
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
-      - name: 依存ライブラリをインストール
+      - name: Install dependencies
         run: |
           pip install playwright pandas beautifulsoup4 lxml
           playwright install chromium
-          playwright install-deps chromium
 
-      - name: スクレイピング実行
+      - name: Run scraping
         run: python scrape_e_uchina.py
 
-      - name: CSVをリポジトリにコミット
+      - name: Commit CSV to repository
         run: |
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add okinawa_fudosan_companies.csv
-          git diff --cached --quiet || git commit -m "自動更新: $(date '+%Y-%m-%d %H:%M JST' -d '+9 hours')"
+          git diff --cached --quiet || git commit -m "auto update: $(date +'%Y-%m-%d %H:%M JST' -d '+9 hours')"
           git push
+
+      - name: Send email report
+        env:
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
+          TO_EMAIL: ${{ secrets.TO_EMAIL }}
+        run: |
+          python - <<'PYEOF'
+          import smtplib
+          import os
+          import pandas as pd
+          from email.mime.text import MIMEText
+          from email.mime.multipart import MIMEMultipart
+          from datetime import datetime, timezone, timedelta
+
+          JST = timezone(timedelta(hours=9))
+          today = datetime.now(JST).strftime("%Y年%m月%d日")
+
+          # CSVを読み込んで集計
+          df = pd.read_csv("okinawa_fudosan_companies.csv", encoding="utf-8-sig")
+          cols = ["賃貸_住居用","賃貸_事業用","賃貸_土地","賃貸_駐車場",
+                  "売買_土地","売買_一戸建て","売買_マンション","売買_その他"]
+
+          lines = []
+          lines.append(f"うちなーらいふ 不動産会社スクレイピングレポート")
+          lines.append(f"生成日時: {today}")
+          lines.append("=" * 50)
+          lines.append(f"取得会社数: {len(df):,} 社")
+          lines.append("")
+          lines.append("【物件数合計】")
+          for col in cols:
+              if col in df.columns:
+                  lines.append(f"  {col}: {df[col].astype(int).sum():,} 件")
+
+          body = "\n".join(lines)
+
+          # メール送信
+          msg = MIMEMultipart()
+          msg["From"]    = os.environ["GMAIL_USER"]
+          msg["To"]      = os.environ["TO_EMAIL"]
+          msg["Subject"] = f"【うちなーらいふ】不動産会社スクレイピングレポート {today}"
+          msg.attach(MIMEText(body, "plain", "utf-8"))
+
+          with smtplib.SMTP("smtp.gmail.com", 587) as server:
+              server.starttls()
+              server.login(os.environ["GMAIL_USER"], os.environ["GMAIL_PASSWORD"])
+              server.send_message(msg)
+          print("メール送信完了")
+          PYEOF
