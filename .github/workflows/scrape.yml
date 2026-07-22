@@ -35,6 +35,48 @@ jobs:
           git diff --cached --quiet || git commit -m "auto update: $(date +'%Y-%m-%d %H:%M JST' -d '+9 hours')"
           git push --force origin HEAD:main
 
+      - name: Upload to Google Drive
+        env:
+          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
+          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+        run: |
+          pip install google-api-python-client google-auth -q
+          python - <<'PYEOF'
+          import os
+          import json
+          from datetime import datetime, timezone, timedelta
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaFileUpload
+          from google.oauth2.service_account import Credentials
+
+          JST = timezone(timedelta(hours=9))
+          today = datetime.now(JST).strftime("%Y-%m-%d")
+
+          # 認証
+          creds_json = json.loads(os.environ["GDRIVE_CREDENTIALS"])
+          creds = Credentials.from_service_account_info(
+              creds_json,
+              scopes=["https://www.googleapis.com/auth/drive.file"]
+          )
+          service = build("drive", "v3", credentials=creds)
+          folder_id = os.environ["GDRIVE_FOLDER_ID"]
+
+          # 同名ファイルが既存なら削除
+          filename = f"okinawa_fudosan_companies_{today}.csv"
+          results = service.files().list(
+              q=f"name='{filename}' and '{folder_id}' in parents and trashed=false",
+              fields="files(id)"
+          ).execute()
+          for f in results.get("files", []):
+              service.files().delete(fileId=f["id"]).execute()
+
+          # アップロード
+          file_metadata = {"name": filename, "parents": [folder_id]}
+          media = MediaFileUpload("okinawa_fudosan_companies.csv", mimetype="text/csv")
+          service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+          print(f"Google Drive アップロード完了: {filename}")
+          PYEOF
+
       - name: Send email report
         env:
           GMAIL_USER: ${{ secrets.GMAIL_USER }}
