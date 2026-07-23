@@ -29,7 +29,7 @@ jobs:
       - name: Run scraping
         env:
           ID_START: "5000"
-          ID_END: "5050"
+          ID_END: "9000"
         run: python scrape_e_uchina.py
 
       - name: Commit CSV to repository
