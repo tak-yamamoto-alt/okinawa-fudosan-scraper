@@ -248,6 +248,8 @@ jobs:
               lines.append("\n※ 前回データなし。比較レポートは次回から生成されます。")
 
           lines.append("\n" + "=" * 60)
+          lines.append("\n【データファイル】")
+          lines.append("  Googleスプレッドシート: https://docs.google.com/spreadsheets/d/1exmwHVw5120oHW25t4nucCKgafj9zURW_BJ4YCqiOEY/edit")
           body = "\n".join(lines)
 
           # 今回のCSVを前回としてバックアップ
