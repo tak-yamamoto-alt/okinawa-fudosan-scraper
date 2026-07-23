@@ -70,16 +70,26 @@ jobs:
           filename = f"okinawa_fudosan_companies_{today}.csv"
           results = service.files().list(
               q=f"name='{filename}' and '{folder_id}' in parents and trashed=false",
-              fields="files(id)"
+              fields="files(id)",
+              supportsAllDrives=True,
+              includeItemsFromAllDrives=True
           ).execute()
           for f in results.get("files", []):
-              service.files().delete(fileId=f["id"]).execute()
+              service.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
 
-          # アップロード
-          file_metadata = {"name": filename, "parents": [folder_id]}
-          media = MediaFileUpload("okinawa_fudosan_companies.csv", mimetype="text/csv")
-          service.files().create(body=file_metadata, media_body=media, fields="id").execute()
-          print(f"Google Drive アップロード完了: {filename}")
+          # アップロード（フォルダIDを親として指定）
+          file_metadata = {
+              "name": filename,
+              "parents": [folder_id]
+          }
+          media = MediaFileUpload("okinawa_fudosan_companies.csv", mimetype="text/csv", resumable=True)
+          file = service.files().create(
+              body=file_metadata,
+              media_body=media,
+              fields="id",
+              supportsAllDrives=True
+          ).execute()
+          print(f"Google Drive アップロード完了: {filename} (id={file.get('id')})")
           PYEOF
 
       - name: Send email report
