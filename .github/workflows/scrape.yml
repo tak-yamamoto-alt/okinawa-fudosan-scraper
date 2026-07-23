@@ -40,19 +40,19 @@ jobs:
           git diff --cached --quiet || git commit -m "auto update: $(date +'%Y-%m-%d %H:%M JST' -d '+9 hours')"
           git push origin HEAD:main || git push --force origin HEAD:main
 
-      - name: Upload to Google Drive
+      - name: Upload to Google Sheets
         env:
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
-          GDRIVE_FOLDER_ID: ${{ secrets.GDRIVE_FOLDER_ID }}
+          GSHEET_ID: "1exmwHVw5120oHW25t4nucCKgafj9zURW_BJ4YCqiOEY"
         run: |
-          pip install google-api-python-client google-auth -q
+          pip install gspread google-auth pandas -q
           python - <<'PYEOF'
           import os
           import json
-          from datetime import datetime, timezone, timedelta
-          from googleapiclient.discovery import build
-          from googleapiclient.http import MediaFileUpload
+          import pandas as pd
+          import gspread
           from google.oauth2.service_account import Credentials
+          from datetime import datetime, timezone, timedelta
 
           JST = timezone(timedelta(hours=9))
           today = datetime.now(JST).strftime("%Y-%m-%d")
@@ -61,35 +61,35 @@ jobs:
           creds_json = json.loads(os.environ["GDRIVE_CREDENTIALS"])
           creds = Credentials.from_service_account_info(
               creds_json,
-              scopes=["https://www.googleapis.com/auth/drive.file"]
+              scopes=[
+                  "https://www.googleapis.com/auth/spreadsheets",
+                  "https://www.googleapis.com/auth/drive"
+              ]
           )
-          service = build("drive", "v3", credentials=creds)
-          folder_id = os.environ["GDRIVE_FOLDER_ID"]
+          client = gspread.authorize(creds)
 
-          # 同名ファイルが既存なら削除
-          filename = f"okinawa_fudosan_companies_{today}.csv"
-          results = service.files().list(
-              q=f"name='{filename}' and '{folder_id}' in parents and trashed=false",
-              fields="files(id)",
-              supportsAllDrives=True,
-              includeItemsFromAllDrives=True
-          ).execute()
-          for f in results.get("files", []):
-              service.files().delete(fileId=f["id"], supportsAllDrives=True).execute()
+          # スプレッドシートを開く
+          sheet_id = os.environ["GSHEET_ID"]
+          spreadsheet = client.open_by_key(sheet_id)
 
-          # アップロード（フォルダIDを親として指定）
-          file_metadata = {
-              "name": filename,
-              "parents": [folder_id]
-          }
-          media = MediaFileUpload("okinawa_fudosan_companies.csv", mimetype="text/csv", resumable=True)
-          file = service.files().create(
-              body=file_metadata,
-              media_body=media,
-              fields="id",
-              supportsAllDrives=True
-          ).execute()
-          print(f"Google Drive アップロード完了: {filename} (id={file.get('id')})")
+          # シート名を今日の日付に設定
+          sheet_name = today
+          try:
+              worksheet = spreadsheet.worksheet(sheet_name)
+              spreadsheet.del_worksheet(worksheet)
+          except Exception:
+              pass
+          worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=2000, cols=20)
+
+          # CSVを読み込んでスプレッドシートに書き込む
+          df = pd.read_csv("okinawa_fudosan_companies.csv", encoding="utf-8-sig")
+          df = df.fillna("")
+
+          # ヘッダー + データを書き込む
+          data = [df.columns.tolist()] + df.values.tolist()
+          worksheet.update(data)
+
+          print(f"Googleスプレッドシート更新完了: シート名={sheet_name} ({len(df)}行)")
           PYEOF
 
       - name: Send email report
