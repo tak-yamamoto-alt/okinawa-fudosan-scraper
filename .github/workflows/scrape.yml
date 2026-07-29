@@ -40,15 +40,6 @@ jobs:
           git diff --cached --quiet || git commit -m "auto update: $(date +'%Y-%m-%d %H:%M JST' -d '+9 hours')"
           git push origin HEAD:main || git push --force origin HEAD:main
 
-      - name: Backup prev CSV
-        run: |
-          cp okinawa_fudosan_companies.csv okinawa_fudosan_companies_prev.csv
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add okinawa_fudosan_companies_prev.csv || true
-          git diff --cached --quiet || git commit -m "backup prev: $(date +'%Y-%m-%d' -d '+9 hours')"
-          git push origin HEAD:main || git push --force origin HEAD:main
-
       - name: Upload to Google Sheets
         env:
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
@@ -99,6 +90,157 @@ jobs:
           worksheet.update(data)
 
           print(f"Googleスプレッドシート更新完了: シート名={sheet_name} ({len(df)}行)")
+
+          # ── サマリシートの更新 ──────────────────────────
+          SUMMARY_SHEET = "サマリ"
+          PROP_COLS = [
+              "賃貸_住居用","賃貸_事業用","賃貸_土地","賃貸_駐車場",
+              "売買_土地","売買_一戸建て","売買_マンション","売買_その他"
+          ]
+
+          def fmt(n):
+              return f"{n:,}"
+
+          def load_df(path):
+              d = pd.read_csv(path, encoding="utf-8-sig")
+              d.columns = [c.replace("貼貸","賃貸") for c in d.columns]
+              if "ID" in d.columns and "会社ID" not in d.columns:
+                  d = d.rename(columns={"ID":"会社ID","URL":"会社URL"})
+              for col in PROP_COLS:
+                  if col in d.columns:
+                      d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0).astype(int)
+              return d
+
+          cur = load_df("okinawa_fudosan_companies.csv")
+          prev_path = "okinawa_fudosan_companies_prev.csv"
+          prev = load_df(prev_path) if os.path.exists(prev_path) else None
+
+          # サマリシートを取得または作成
+          try:
+              summary_ws = spreadsheet.worksheet(SUMMARY_SHEET)
+          except Exception:
+              summary_ws = spreadsheet.add_worksheet(title=SUMMARY_SHEET, rows=500, cols=10)
+
+          summary_rows = []
+          summary_rows.append([f"うちなーらいふ 不動産会社スクレイピングサマリ"])
+          summary_rows.append([f"更新日時: {today}"])
+          summary_rows.append([""])
+
+          # 今回の取得結果
+          summary_rows.append(["【今回の取得結果】"])
+          summary_rows.append(["取得会社数", f"{fmt(len(cur))} 社"])
+          summary_rows.append(["ID範囲", f"{cur['会社ID'].min()} 〜 {cur['会社ID'].max()}"])
+          summary_rows.append([""])
+          summary_rows.append(["種別", "件数"])
+          for col in PROP_COLS:
+              if col in cur.columns:
+                  summary_rows.append([col, cur[col].sum()])
+          summary_rows.append([""])
+
+          if prev is not None:
+              # 前回比較サマリー
+              summary_rows.append(["【前回比較サマリー】"])
+              summary_rows.append(["項目", "前回", "今回", "増減", "増減率"])
+              summary_rows.append(["会社数", len(prev), len(cur), len(cur)-len(prev), f"{(len(cur)-len(prev)):+d} 社"])
+              for col in PROP_COLS:
+                  if col in cur.columns and col in prev.columns:
+                      p = int(prev[col].sum())
+                      c = int(cur[col].sum())
+                      diff = c - p
+                      rate = (diff / p * 100) if p > 0 else 0
+                      summary_rows.append([col, p, c, diff, f"{rate:+.1f}%"])
+              summary_rows.append([""])
+
+              # 新規・退出会社
+              prev_ids = set(prev["会社ID"].astype(int))
+              cur_ids  = set(cur["会社ID"].astype(int))
+              new_ids  = cur_ids - prev_ids
+              del_ids  = prev_ids - cur_ids
+
+              summary_rows.append([f"【新規登録会社】{len(new_ids)} 社"])
+              if new_ids:
+                  summary_rows.append(["会社ID", "会社名", "エリア", "合計物件数"])
+                  new_df = cur[cur["会社ID"].isin(new_ids)].copy()
+                  new_df["合計物件数"] = new_df[PROP_COLS].sum(axis=1)
+                  new_df = new_df.sort_values("合計物件数", ascending=False)
+                  import re as _re
+                  for _, row in new_df.iterrows():
+                      address = str(row.get("所在地",""))
+                      m = _re.search(r"県(.{2,6}?[市区町村])", address)
+                      area = m.group(1) if m else ""
+                      summary_rows.append([int(row["会社ID"]), row["会社名"], area, int(row["合計物件数"])])
+              summary_rows.append([""])
+
+              summary_rows.append([f"【退出・削除会社】{len(del_ids)} 社"])
+              if del_ids:
+                  summary_rows.append(["会社ID", "会社名"])
+                  del_df = prev[prev["会社ID"].isin(del_ids)][["会社ID","会社名"]]
+                  for _, row in del_df.iterrows():
+                      summary_rows.append([int(row["会社ID"]), row["会社名"]])
+              summary_rows.append([""])
+
+              # 物件数増加TOP20
+              common_ids  = cur_ids & prev_ids
+              cur_common  = cur[cur["会社ID"].isin(common_ids)].set_index("会社ID")
+              prev_common = prev[prev["会社ID"].isin(common_ids)].set_index("会社ID")
+              cur_total   = cur_common[PROP_COLS].sum(axis=1)
+              prev_total  = prev_common[PROP_COLS].sum(axis=1)
+              diff_total  = (cur_total - prev_total).sort_values(ascending=False)
+
+              summary_rows.append(["【物件数が大きく伸びた会社 TOP20】"])
+              summary_rows.append(["会社ID", "会社名", "前回合計", "今回合計", "増減", "増加種別"])
+              top_up = diff_total[diff_total > 0].head(20)
+              if top_up.empty:
+                  summary_rows.append(["（増加した会社なし）"])
+              else:
+                  for cid, diff in top_up.items():
+                      name = cur_common.loc[cid, "会社名"]
+                      col_diffs = []
+                      for col in PROP_COLS:
+                          if col not in cur_common.columns: continue
+                          p = int(prev_common.loc[cid, col])
+                          c = int(cur_common.loc[cid, col])
+                          d = c - p
+                          if d > 0:
+                              col_diffs.append(f"{col}:+{d}({p}→{c})")
+                      summary_rows.append([
+                          cid, name,
+                          int(prev_total[cid]), int(cur_total[cid]),
+                          f"+{int(diff)}",
+                          " / ".join(col_diffs)
+                      ])
+              summary_rows.append([""])
+
+              # 物件数減少TOP10
+              summary_rows.append(["【物件数が大きく減った会社 TOP10】"])
+              summary_rows.append(["会社ID", "会社名", "前回合計", "今回合計", "増減", "減少種別"])
+              top_down = diff_total[diff_total < 0].tail(10).sort_values()
+              if top_down.empty:
+                  summary_rows.append(["（減少した会社なし）"])
+              else:
+                  for cid, diff in top_down.items():
+                      name = cur_common.loc[cid, "会社名"]
+                      col_diffs = []
+                      for col in PROP_COLS:
+                          if col not in cur_common.columns: continue
+                          p = int(prev_common.loc[cid, col])
+                          c = int(cur_common.loc[cid, col])
+                          d = c - p
+                          if d < 0:
+                              col_diffs.append(f"{col}:{d}({p}→{c})")
+                      summary_rows.append([
+                          cid, name,
+                          int(prev_total[cid]), int(cur_total[cid]),
+                          str(int(diff)),
+                          " / ".join(col_diffs)
+                      ])
+          else:
+              summary_rows.append(["※ 前回データなし。比較は次回から表示されます。"])
+
+          # シートをクリアして書き込み
+          summary_ws.clear()
+          summary_ws.update(summary_rows)
+          print(f"サマリシート更新完了: {len(summary_rows)} 行")
           PYEOF
 
       - name: Send email report
@@ -252,10 +394,6 @@ jobs:
           lines.append("  Googleスプレッドシート: https://docs.google.com/spreadsheets/d/1exmwHVw5120oHW25t4nucCKgafj9zURW_BJ4YCqiOEY/edit")
           body = "\n".join(lines)
 
-          # 今回のCSVを前回としてバックアップ
-          import shutil
-          shutil.copy(CURRENT_FILE, PREV_FILE)
-
           # メール送信
           msg = MIMEMultipart()
           msg["From"]    = os.environ["GMAIL_USER"]
@@ -268,4 +406,17 @@ jobs:
               server.login(os.environ["GMAIL_USER"], os.environ["GMAIL_PASSWORD"])
               server.send_message(msg)
           print("メール送信完了")
+
+          # メール送信完了後にprevをバックアップ
+          import shutil
+          shutil.copy(CURRENT_FILE, PREV_FILE)
+          print("prevバックアップ完了")
           PYEOF
+
+      - name: Backup prev CSV to GitHub
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add okinawa_fudosan_companies_prev.csv || true
+          git diff --cached --quiet || git commit -m "backup prev: $(date +'%Y-%m-%d' -d '+9 hours')"
+          git push origin HEAD:main || git push --force origin HEAD:main
