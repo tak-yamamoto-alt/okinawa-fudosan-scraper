@@ -237,10 +237,15 @@ jobs:
           else:
               summary_rows.append(["※ 前回データなし。比較は次回から表示されます。"])
 
+          # int64 → Python int に変換（JSON serializable対応）
+          def convert_row(row):
+              return [int(v) if hasattr(v, "item") else v for v in row]
+          summary_rows_clean = [convert_row(r) for r in summary_rows]
+
           # シートをクリアして書き込み
           summary_ws.clear()
-          summary_ws.update(summary_rows)
-          print(f"サマリシート更新完了: {len(summary_rows)} 行")
+          summary_ws.update(summary_rows_clean)
+          print(f"サマリシート更新完了: {len(summary_rows_clean)} 行")
           PYEOF
 
       - name: Send email report
