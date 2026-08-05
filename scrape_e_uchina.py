@@ -38,8 +38,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add okinawa_fudosan_companies.csv || true
           git diff --cached --quiet || git commit -m "auto update: $(date +'%Y-%m-%d %H:%M JST' -d '+9 hours')"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          git push --force origin HEAD:main
 
       - name: Upload to Google Sheets
         env:
@@ -425,5 +424,4 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add okinawa_fudosan_companies_prev.csv || true
           git diff --cached --quiet || git commit -m "backup prev: $(date +'%Y-%m-%d' -d '+9 hours')"
-          git pull --rebase origin main
-          git push origin HEAD:main
+          git push --force origin HEAD:main
