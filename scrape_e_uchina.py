@@ -1,427 +1,189 @@
-name: Daily Scraping
+import asyncio
+import re
+import logging
+import pandas as pd
+from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright, Page
 
-on:
-  schedule:
-    - cron: '0 15 * * *'  # 毎日00:00 JST (= 15:00 UTC)
-  workflow_dispatch:        # 手動実行も可能
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
-jobs:
-  scrape:
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    permissions:
-      contents: write
+BASE_URL    = "https://www.e-uchina.net"
+import os
+ID_START    = int(os.environ.get("ID_START", 5000))
+ID_END      = int(os.environ.get("ID_END",   9000))
+SLEEP_MS    = 1500
+OUTPUT_FILE = "okinawa_fudosan_companies.csv"
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+COL_KAISHA  = "\u4f1a\u793e\u540d"
+COL_JUSHO   = "\u6240\u5728\u5730"
+COL_EIGYO   = "\u55b6\u696d\u6642\u9593"
+COL_TEIKYUU = "\u5b9a\u4f11\u65e5"
+COL_MENKYO  = "\u514d\u8a31"
+COL_BIKO    = "\u5099\u8003_\u99d0\u8eca\u5834"
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+PROPERTY_TYPES = {
+    "jukyo":   "\u8cc3\u8cb8_\u4f4f\u5c45\u7528",
+    "jigyo":   "\u8cc3\u8cb8_\u4e8b\u696d\u7528",
+    "yard":    "\u8cc3\u8cb8_\u571f\u5730",
+    "parking": "\u8cc3\u8cb8_\u99d0\u8eca\u5834",
+    "tochi":   "\u58f2\u8cb7_\u571f\u5730",
+    "house":   "\u58f2\u8cb7_\u4e00\u6238\u5efa\u3066",
+    "mansion": "\u58f2\u8cb7_\u30de\u30f3\u30b7\u30e7\u30f3",
+    "sonota":  "\u58f2\u8cb7_\u305d\u306e\u4ed6",
+}
 
-      - name: Install dependencies
-        run: |
-          pip install playwright pandas beautifulsoup4 lxml
-          playwright install chromium
 
-      - name: Run scraping
-        env:
-          ID_START: "5000"
-          ID_END: "9000"
-        run: python scrape_e_uchina.py
+def parse_property_counts(soup: BeautifulSoup, company_id: int) -> dict:
+    counts = {col: "0" for col in PROPERTY_TYPES.values()}
+    for type_key, col_name in PROPERTY_TYPES.items():
+        link = soup.find("a", href=f"{BASE_URL}/fudosan_kaisha/{company_id}/{type_key}") or \
+               soup.find("a", href=f"/fudosan_kaisha/{company_id}/{type_key}")
+        if not link:
+            continue
+        text = link.get_text(strip=True)
+        m = re.search(r"(\d+)\u4ef6", text)
+        if m:
+            counts[col_name] = m.group(1)
+    return counts
 
-      - name: Commit CSV to repository
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add okinawa_fudosan_companies.csv || true
-          git diff --cached --quiet || git commit -m "auto update: $(date +'%Y-%m-%d %H:%M JST' -d '+9 hours')"
-          git push --force origin HEAD:main
 
-      - name: Upload to Google Sheets
-        env:
-          GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
-          GSHEET_ID: "1RO-VyL7IQzZ_hLJLTPKE2x58f_9LjxEw2FRyIjhQldw"
-        run: |
-          pip install gspread google-auth pandas -q
-          python - <<'PYEOF'
-          import os
-          import json
-          import pandas as pd
-          import gspread
-          from google.oauth2.service_account import Credentials
-          from datetime import datetime, timezone, timedelta
+def parse_info_table(soup: BeautifulSoup) -> dict:
+    info: dict = {}
+    for tr in soup.find_all("tr"):
+        cells = tr.find_all(["th", "td"])
+        cell_texts = []
+        for cell in cells:
+            for a in cell.find_all("a"):
+                if a.get_text(strip=True) in ["\u5730\u56f3", "map"]:
+                    a.decompose()
+            cell_texts.append(cell.get_text(strip=True))
+        if len(cell_texts) >= 4:
+            if cell_texts[0]: info[cell_texts[0]] = cell_texts[1]
+            if cell_texts[2]: info[cell_texts[2]] = cell_texts[3]
+        elif len(cell_texts) >= 2:
+            if cell_texts[0]: info[cell_texts[0]] = cell_texts[1]
+    return info
 
-          JST = timezone(timedelta(hours=9))
-          today = datetime.now(JST).strftime("%Y-%m-%d")
 
-          # 認証
-          creds_json = json.loads(os.environ["GDRIVE_CREDENTIALS"])
-          creds = Credentials.from_service_account_info(
-              creds_json,
-              scopes=[
-                  "https://www.googleapis.com/auth/spreadsheets",
-                  "https://www.googleapis.com/auth/drive"
-              ]
-          )
-          client = gspread.authorize(creds)
+def is_company_page(soup: BeautifulSoup) -> bool:
+    h1 = soup.find("h1")
+    if not h1:
+        return False
+    text = h1.get_text(strip=True)
+    return bool(text) and "\u3046\u3061\u306a\u30fc\u3089\u3044\u3075" not in text
 
-          # スプレッドシートを開く
-          sheet_id = os.environ["GSHEET_ID"]
-          spreadsheet = client.open_by_key(sheet_id)
 
-          # シート名を今日の日付に設定
-          sheet_name = today
-          try:
-              worksheet = spreadsheet.worksheet(sheet_name)
-              spreadsheet.del_worksheet(worksheet)
-          except Exception:
-              pass
-          worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=2000, cols=20)
+async def fetch_company(page: Page, company_id: int) -> dict | None:
+    url = f"{BASE_URL}/fudosan_kaisha/{company_id}"
+    for attempt in range(1, 4):
+        try:
+            resp = await page.goto(url, wait_until="load", timeout=45000)
+            if resp and resp.status == 404:
+                return None
+            try:
+                await page.wait_for_selector(
+                    f"a[href*='/fudosan_kaisha/{company_id}/']",
+                    timeout=10000
+                )
+            except Exception:
+                pass
+            break
+        except Exception as e:
+            if attempt < 3:
+                logger.warning(f"ID={company_id} retry {attempt}/3: {e}")
+                await asyncio.sleep(3)
+            else:
+                logger.warning(f"ID={company_id} skip: {e}")
+                return None
 
-          # CSVを読み込んでスプレッドシートに書き込む
-          df = pd.read_csv("okinawa_fudosan_companies.csv", encoding="utf-8-sig")
-          df = df.fillna("")
+    html = await page.content()
+    soup = BeautifulSoup(html, "lxml")
 
-          # ヘッダー + データを書き込む
-          data = [df.columns.tolist()] + df.values.tolist()
-          worksheet.update(data)
+    if not is_company_page(soup):
+        return None
 
-          print(f"Googleスプレッドシート更新完了: シート名={sheet_name} ({len(df)}行)")
+    data: dict = {"\u4f1a\u793e\u30a2\u30a4\u30c7\u30a3": company_id,
+                  "\u4f1a\u793e\u30a2\u30a4\u30c7\u30a3": company_id}
 
-          # ── サマリシートの更新 ──────────────────────────
-          SUMMARY_SHEET = "サマリ"
-          PROP_COLS = [
-              "賃貸_住居用","賃貸_事業用","賃貸_土地","賃貸_駐車場",
-              "売買_土地","売買_一戸建て","売買_マンション","売買_その他"
-          ]
+    # 会社ID・URL
+    data = {"会社ID": company_id, "会社URL": url}
 
-          def fmt(n):
-              return f"{n:,}"
+    try:
+        data[COL_KAISHA] = soup.find("h1").get_text(strip=True)
+    except Exception:
+        data[COL_KAISHA] = ""
 
-          def load_df(path):
-              d = pd.read_csv(path, encoding="utf-8-sig")
-              d.columns = [c.replace("貼貸","賃貸") for c in d.columns]
-              if "ID" in d.columns and "会社ID" not in d.columns:
-                  d = d.rename(columns={"ID":"会社ID","URL":"会社URL"})
-              for col in PROP_COLS:
-                  if col in d.columns:
-                      d[col] = pd.to_numeric(d[col], errors="coerce").fillna(0).astype(int)
-              return d
+    info = parse_info_table(soup)
+    data[COL_JUSHO]   = info.get("\u4f4f\u6240", "")
+    data["TEL"]       = info.get("TEL", "")
+    data[COL_EIGYO]   = info.get("\u55b6\u696d\u6642\u9593", "")
+    data[COL_TEIKYUU] = info.get("\u5b9a\u4f11\u65e5", "")
+    data[COL_MENKYO]  = info.get("\u514d\u8a31", "")
+    data["HP"]        = info.get("HP", "")
+    data[COL_BIKO]    = info.get("\u5099\u8003", "")
 
-          cur = load_df("okinawa_fudosan_companies.csv")
-          prev_path = "okinawa_fudosan_companies_prev.csv"
-          prev = load_df(prev_path) if os.path.exists(prev_path) else None
+    counts = parse_property_counts(soup, company_id)
+    data.update(counts)
 
-          # サマリシートを取得または作成
-          try:
-              summary_ws = spreadsheet.worksheet(SUMMARY_SHEET)
-          except Exception:
-              summary_ws = spreadsheet.add_worksheet(title=SUMMARY_SHEET, rows=500, cols=10)
+    await page.wait_for_timeout(SLEEP_MS)
+    return data
 
-          summary_rows = []
-          summary_rows.append([f"うちなーらいふ 不動産会社スクレイピングサマリ"])
-          summary_rows.append([f"更新日時: {today}"])
-          summary_rows.append([""])
 
-          # 今回の取得結果
-          summary_rows.append(["【今回の取得結果】"])
-          summary_rows.append(["取得会社数", f"{fmt(len(cur))} 社"])
-          summary_rows.append(["ID範囲", f"{cur['会社ID'].min()} 〜 {cur['会社ID'].max()}"])
-          summary_rows.append([""])
-          summary_rows.append(["種別", "件数"])
-          for col in PROP_COLS:
-              if col in cur.columns:
-                  summary_rows.append([col, cur[col].sum()])
-          summary_rows.append([""])
+async def main():
+    logger.info("=== scraping start ===")
+    logger.info(f"ID range: {ID_START} to {ID_END}")
 
-          if prev is not None:
-              # 前回比較サマリー
-              summary_rows.append(["【前回比較サマリー】"])
-              summary_rows.append(["項目", "前回", "今回", "増減", "増減率"])
-              summary_rows.append(["会社数", len(prev), len(cur), len(cur)-len(prev), f"{(len(cur)-len(prev)):+d} 社"])
-              for col in PROP_COLS:
-                  if col in cur.columns and col in prev.columns:
-                      p = int(prev[col].sum())
-                      c = int(cur[col].sum())
-                      diff = c - p
-                      rate = (diff / p * 100) if p > 0 else 0
-                      summary_rows.append([col, p, c, diff, f"{rate:+.1f}%"])
-              summary_rows.append([""])
+    records = []
+    total_range = ID_END - ID_START + 1
 
-              # 新規・退出会社
-              prev_ids = set(prev["会社ID"].astype(int))
-              cur_ids  = set(cur["会社ID"].astype(int))
-              new_ids  = cur_ids - prev_ids
-              del_ids  = prev_ids - cur_ids
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            locale="ja-JP",
+        )
+        page = await context.new_page()
 
-              summary_rows.append([f"【新規登録会社】{len(new_ids)} 社"])
-              if new_ids:
-                  summary_rows.append(["会社ID", "会社名", "エリア", "合計物件数"])
-                  new_df = cur[cur["会社ID"].isin(new_ids)].copy()
-                  new_df["合計物件数"] = new_df[PROP_COLS].sum(axis=1)
-                  new_df = new_df.sort_values("合計物件数", ascending=False)
-                  import re as _re
-                  for _, row in new_df.iterrows():
-                      address = str(row.get("所在地",""))
-                      m = _re.search(r"県(.{2,6}?[市区町村])", address)
-                      area = m.group(1) if m else ""
-                      summary_rows.append([int(row["会社ID"]), row["会社名"], area, int(row["合計物件数"])])
-              summary_rows.append([""])
+        try:
+            for company_id in range(ID_START, ID_END + 1):
+                elapsed = company_id - ID_START + 1
+                if elapsed % 50 == 0:
+                    logger.info(f"progress: {elapsed}/{total_range}  found: {len(records)}")
 
-              summary_rows.append([f"【退出・削除会社】{len(del_ids)} 社"])
-              if del_ids:
-                  summary_rows.append(["会社ID", "会社名"])
-                  del_df = prev[prev["会社ID"].isin(del_ids)][["会社ID","会社名"]]
-                  for _, row in del_df.iterrows():
-                      summary_rows.append([int(row["会社ID"]), row["会社名"]])
-              summary_rows.append([""])
+                record = await fetch_company(page, company_id)
+                if record:
+                    jukyo   = record.get(PROPERTY_TYPES["jukyo"], "0")
+                    tochi   = record.get(PROPERTY_TYPES["tochi"], "0")
+                    house   = record.get(PROPERTY_TYPES["house"], "0")
+                    logger.info(f"  ID={company_id} [{record[COL_KAISHA]}] "
+                                f"jukyo:{jukyo} tochi:{tochi} house:{house}")
+                    records.append(record)
+        finally:
+            await context.close()
+            await browser.close()
 
-              # 物件数増加TOP20
-              common_ids  = cur_ids & prev_ids
-              cur_common  = cur[cur["会社ID"].isin(common_ids)].set_index("会社ID")
-              prev_common = prev[prev["会社ID"].isin(common_ids)].set_index("会社ID")
-              cur_total   = cur_common[PROP_COLS].sum(axis=1)
-              prev_total  = prev_common[PROP_COLS].sum(axis=1)
-              diff_total  = (cur_total - prev_total).sort_values(ascending=False)
+    if not records:
+        logger.error("no data found")
+        return
 
-              summary_rows.append(["【物件数が大きく伸びた会社 TOP20】"])
-              summary_rows.append(["会社ID", "会社名", "前回合計", "今回合計", "増減", "増加種別"])
-              top_up = diff_total[diff_total > 0].head(20)
-              if top_up.empty:
-                  summary_rows.append(["（増加した会社なし）"])
-              else:
-                  for cid, diff in top_up.items():
-                      name = cur_common.loc[cid, "会社名"]
-                      col_diffs = []
-                      for col in PROP_COLS:
-                          if col not in cur_common.columns: continue
-                          p = int(prev_common.loc[cid, col])
-                          c = int(cur_common.loc[cid, col])
-                          d = c - p
-                          if d > 0:
-                              col_diffs.append(f"{col}:+{d}({p}→{c})")
-                      summary_rows.append([
-                          cid, name,
-                          int(prev_total[cid]), int(cur_total[cid]),
-                          f"+{int(diff)}",
-                          " / ".join(col_diffs)
-                      ])
-              summary_rows.append([""])
+    cols = [
+        "会社ID", COL_KAISHA, COL_JUSHO, "TEL", COL_EIGYO, COL_TEIKYUU,
+        COL_MENKYO, "HP", COL_BIKO,
+    ] + list(PROPERTY_TYPES.values()) + ["会社URL"]
 
-              # 物件数減少TOP10
-              summary_rows.append(["【物件数が大きく減った会社 TOP10】"])
-              summary_rows.append(["会社ID", "会社名", "前回合計", "今回合計", "増減", "減少種別"])
-              top_down = diff_total[diff_total < 0].tail(10).sort_values()
-              if top_down.empty:
-                  summary_rows.append(["（減少した会社なし）"])
-              else:
-                  for cid, diff in top_down.items():
-                      name = cur_common.loc[cid, "会社名"]
-                      col_diffs = []
-                      for col in PROP_COLS:
-                          if col not in cur_common.columns: continue
-                          p = int(prev_common.loc[cid, col])
-                          c = int(cur_common.loc[cid, col])
-                          d = c - p
-                          if d < 0:
-                              col_diffs.append(f"{col}:{d}({p}→{c})")
-                      summary_rows.append([
-                          cid, name,
-                          int(prev_total[cid]), int(cur_total[cid]),
-                          str(int(diff)),
-                          " / ".join(col_diffs)
-                      ])
-          else:
-              summary_rows.append(["※ 前回データなし。比較は次回から表示されます。"])
+    df = pd.DataFrame(records, columns=cols)
+    df.to_csv(OUTPUT_FILE, index=False, encoding="utf-8-sig")
+    logger.info(f"=== done: {len(df)} companies saved to {OUTPUT_FILE} ===")
 
-          # int64 → Python int に変換（JSON serializable対応）
-          def convert_row(row):
-              return [int(v) if hasattr(v, "item") else v for v in row]
-          summary_rows_clean = [convert_row(r) for r in summary_rows]
 
-          # シートをクリアして書き込み
-          summary_ws.clear()
-          summary_ws.update(summary_rows_clean)
-          print(f"サマリシート更新完了: {len(summary_rows_clean)} 行")
-          PYEOF
-
-      - name: Send email report
-        env:
-          GMAIL_USER: ${{ secrets.GMAIL_USER }}
-          GMAIL_PASSWORD: ${{ secrets.GMAIL_PASSWORD }}
-          TO_EMAIL: ${{ secrets.TO_EMAIL }}
-        run: |
-          python - <<'PYEOF'
-          import smtplib
-          import os
-          import re
-          import pandas as pd
-          from email.mime.text import MIMEText
-          from email.mime.multipart import MIMEMultipart
-          from datetime import datetime, timezone, timedelta
-
-          JST = timezone(timedelta(hours=9))
-          today = datetime.now(JST).strftime("%Y年%m月%d日")
-
-          CURRENT_FILE = "okinawa_fudosan_companies.csv"
-          PREV_FILE    = "okinawa_fudosan_companies_prev.csv"
-
-          PROP_COLS = [
-              "賃貸_住居用","賃貸_事業用","賃貸_土地","賃貸_駐車場",
-              "売買_土地","売買_一戸建て","売買_マンション","売買_その他"
-          ]
-
-          def load_csv(path):
-              df = pd.read_csv(path, encoding="utf-8-sig")
-              df.columns = [c.replace("貼貸","賃貸") for c in df.columns]
-              if "ID" in df.columns and "会社ID" not in df.columns:
-                  df = df.rename(columns={"ID":"会社ID","URL":"会社URL"})
-              for col in PROP_COLS:
-                  if col in df.columns:
-                      df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
-              return df
-
-          def fmt(n):
-              return f"{n:,}"
-
-          cur = load_csv(CURRENT_FILE)
-          prev = load_csv(PREV_FILE) if os.path.exists(PREV_FILE) else None
-
-          lines = []
-          lines.append("=" * 60)
-          lines.append("  うちなーらいふ 不動産会社スクレイピングレポート")
-          lines.append(f"  生成日時: {today}")
-          lines.append("=" * 60)
-
-          lines.append("\n【今回の取得結果】")
-          lines.append(f"  取得会社数: {fmt(len(cur))} 社")
-          lines.append(f"  ID範囲: {cur['会社ID'].min()} 〜 {cur['会社ID'].max()}")
-          lines.append("\n  物件数合計:")
-          cur_totals = {}
-          for col in PROP_COLS:
-              if col in cur.columns:
-                  total = cur[col].sum()
-                  cur_totals[col] = total
-                  lines.append(f"    {col}: {fmt(total)} 件")
-
-          if prev is not None:
-              lines.append("\n" + "-" * 60)
-              lines.append("【前回比較サマリー】")
-              diff_sha = len(cur) - len(prev)
-              sign = "+" if diff_sha >= 0 else ""
-              lines.append(f"  前回会社数: {fmt(len(prev))} 社  →  今回: {fmt(len(cur))} 社  ({sign}{diff_sha} 社)")
-              lines.append(f"\n  {'種別':<18} {'前回':>8} {'今回':>8} {'増減':>8} {'増減率':>7}")
-              lines.append(f"  {'-'*18} {'-'*8} {'-'*8} {'-'*8} {'-'*7}")
-              for col in PROP_COLS:
-                  if col in cur.columns and col in prev.columns:
-                      p = prev[col].sum()
-                      c = cur[col].sum()
-                      diff = c - p
-                      rate = (diff / p * 100) if p > 0 else 0
-                      sign = "+" if diff >= 0 else "-"
-                      lines.append(f"  {col:<18} {fmt(p):>8} {fmt(c):>8} {sign}{fmt(abs(diff)):>7} {rate:>+6.1f}%")
-
-              prev_ids = set(prev["会社ID"].astype(int))
-              cur_ids  = set(cur["会社ID"].astype(int))
-              new_ids  = cur_ids - prev_ids
-              del_ids  = prev_ids - cur_ids
-
-              lines.append(f"\n【新規登録会社】{len(new_ids)} 社")
-              if new_ids:
-                  new_df = cur[cur["会社ID"].isin(new_ids)].copy()
-                  new_df["合計物件数"] = new_df[PROP_COLS].sum(axis=1)
-                  new_df = new_df.sort_values("合計物件数", ascending=False)
-                  for _, row in new_df.head(20).iterrows():
-                      address = str(row.get("所在地",""))
-                      m = re.search(r"県(.{2,6}?[市区町村])", address)
-                      area_str = f" {m.group(1)}" if m else ""
-                      lines.append(f"  ID={int(row['会社ID'])} [{row['会社名']}]{area_str} 合計:{int(row['合計物件数'])}件")
-
-              lines.append(f"\n【退出・削除会社】{len(del_ids)} 社")
-              if del_ids:
-                  del_df = prev[prev["会社ID"].isin(del_ids)][["会社ID","会社名"]].head(20)
-                  for _, row in del_df.iterrows():
-                      lines.append(f"  ID={int(row['会社ID'])} [{row['会社名']}]")
-
-              lines.append("\n" + "-" * 60)
-              lines.append("【物件数が大きく伸びた会社 TOP20（全種別合計）】")
-              common_ids  = cur_ids & prev_ids
-              cur_common  = cur[cur["会社ID"].isin(common_ids)].set_index("会社ID")
-              prev_common = prev[prev["会社ID"].isin(common_ids)].set_index("会社ID")
-              cur_total   = cur_common[PROP_COLS].sum(axis=1)
-              prev_total  = prev_common[PROP_COLS].sum(axis=1)
-              diff_total  = (cur_total - prev_total).sort_values(ascending=False)
-
-              top_up = diff_total[diff_total > 0].head(20)
-              if top_up.empty:
-                  lines.append("  （増加した会社なし）")
-              else:
-                  for cid, diff in top_up.items():
-                      name = cur_common.loc[cid, "会社名"]
-                      lines.append(f"  ID={cid} [{name}] 合計: {fmt(int(prev_total[cid]))}件 → {fmt(int(cur_total[cid]))}件 (＋{fmt(int(diff))}件)")
-                      col_diffs = []
-                      for col in PROP_COLS:
-                          if col not in cur_common.columns: continue
-                          p = int(prev_common.loc[cid, col])
-                          c = int(cur_common.loc[cid, col])
-                          d = c - p
-                          if d > 0:
-                              col_diffs.append(f"{col}:＋{d}件({p}→{c})")
-                      if col_diffs:
-                          lines.append(f"    └ {' / '.join(col_diffs)}")
-
-              lines.append("\n【物件数が大きく減った会社 TOP10（全種別合計）】")
-              top_down = diff_total[diff_total < 0].tail(10).sort_values()
-              if top_down.empty:
-                  lines.append("  （減少した会社なし）")
-              else:
-                  for cid, diff in top_down.items():
-                      name = cur_common.loc[cid, "会社名"]
-                      lines.append(f"  ID={cid} [{name}] 合計: {fmt(int(prev_total[cid]))}件 → {fmt(int(cur_total[cid]))}件 (－{fmt(abs(int(diff)))}件)")
-                      col_diffs = []
-                      for col in PROP_COLS:
-                          if col not in cur_common.columns: continue
-                          p = int(prev_common.loc[cid, col])
-                          c = int(cur_common.loc[cid, col])
-                          d = c - p
-                          if d < 0:
-                              col_diffs.append(f"{col}:－{abs(d)}件({p}→{c})")
-                      if col_diffs:
-                          lines.append(f"    └ {' / '.join(col_diffs)}")
-          else:
-              lines.append("\n※ 前回データなし。比較レポートは次回から生成されます。")
-
-          lines.append("\n" + "=" * 60)
-          lines.append("\n【データファイル】")
-          lines.append("  Googleスプレッドシート: https://docs.google.com/spreadsheets/d/1RO-VyL7IQzZ_hLJLTPKE2x58f_9LjxEw2FRyIjhQldw/edit")
-          body = "\n".join(lines)
-
-          # メール送信
-          msg = MIMEMultipart()
-          msg["From"]    = os.environ["GMAIL_USER"]
-          msg["To"]      = os.environ["TO_EMAIL"]
-          msg["Subject"] = f"【うちなーらいふ】不動産会社スクレイピングレポート {today}"
-          msg.attach(MIMEText(body, "plain", "utf-8"))
-
-          with smtplib.SMTP("smtp.gmail.com", 587) as server:
-              server.starttls()
-              server.login(os.environ["GMAIL_USER"], os.environ["GMAIL_PASSWORD"])
-              server.send_message(msg)
-          print("メール送信完了")
-
-          # メール送信完了後にprevをバックアップ
-          import shutil
-          shutil.copy(CURRENT_FILE, PREV_FILE)
-          print("prevバックアップ完了")
-          PYEOF
-
-      - name: Backup prev CSV to GitHub
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add okinawa_fudosan_companies_prev.csv || true
-          git diff --cached --quiet || git commit -m "backup prev: $(date +'%Y-%m-%d' -d '+9 hours')"
-          git push --force origin HEAD:main
+if __name__ == "__main__":
+    asyncio.run(main())
