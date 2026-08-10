@@ -396,7 +396,7 @@ jobs:
 
           lines.append("\n" + "=" * 60)
           lines.append("\n【データファイル】")
-          lines.append("  Googleスプレッドシート: https://docs.google.com/spreadsheets/d/1RO-VyL7IQzZ_hLJLTPKE2x58f_9LjxEw2FRyIjhQldw/edit")
+          lines.append("  Googleスプレッドシート: https://docs.google.com/spreadsheets/d/1exmwHVw5120oHW25t4nucCKgafj9zURW_BJ4YCqiOEY/edit")
           body = "\n".join(lines)
 
           # メール送信
