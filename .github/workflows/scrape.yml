@@ -43,7 +43,7 @@ jobs:
       - name: Upload to Google Sheets
         env:
           GDRIVE_CREDENTIALS: ${{ secrets.GDRIVE_CREDENTIALS }}
-          GSHEET_ID: "1RO-VyL7IQzZ_hLJLTPKE2x58f_9LjxEw2FRyIjhQldw"
+          GSHEET_ID: "1exmwHVw5120oHW25t4nucCKgafj9zURW_BJ4YCqiOEY"
         run: |
           pip install gspread google-auth pandas -q
           python - <<'PYEOF'
